@@ -123,3 +123,55 @@ async fn test_conn_stats() -> Result<()> {
 
     Ok(())
 }
+
+/// Descriptors this process holds open, via `/dev/fd` (macOS and Linux).
+#[cfg(unix)]
+fn open_descriptors() -> usize {
+    std::fs::read_dir("/dev/fd").expect("/dev/fd").count()
+}
+
+/// After `Agent::close`, none of the agent's candidate sockets may survive —
+/// even while the `Conn` the agent handed out is still held by the caller.
+///
+/// Every host candidate owns a UDP socket. `close` deletes the agent's
+/// candidate lists, but the connectivity checklist and selected pair live on
+/// the `AgentConn` handed to the caller, and each pair holds its local
+/// candidate, which holds the socket. An upper layer that keeps the conn a
+/// moment longer (a reader task draining, a mux closing) therefore keeps every
+/// socket the agent ever gathered — and a layer that keeps it forever leaks
+/// them all. Measured downstream at one socket per candidate per session,
+/// until the process hit its descriptor limit and could gather nothing.
+///
+/// Holding the conns across the close here is the point of the test.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_close_releases_candidate_sockets_while_conn_is_held() -> Result<()> {
+    let baseline = open_descriptors();
+    let (ca, cb, a_agent, b_agent) = pipe(None, None).await?;
+    let during = open_descriptors();
+    assert!(
+        during > baseline,
+        "a connected pair of agents holds sockets: baseline={baseline} during={during}"
+    );
+
+    a_agent.close().await?;
+    b_agent.close().await?;
+
+    // Socket release rides on task teardown, which is asynchronous; wait a
+    // bounded moment rather than asserting on the first read.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut after = open_descriptors();
+    while after > baseline + 2 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        after = open_descriptors();
+    }
+    assert!(
+        after <= baseline + 2,
+        "closed agents must release their candidate sockets even while their conns are held: \
+         baseline={baseline} during={during} after={after}"
+    );
+
+    drop(ca);
+    drop(cb);
+    Ok(())
+}

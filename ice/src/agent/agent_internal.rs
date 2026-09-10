@@ -623,6 +623,32 @@ impl AgentInternal {
             }
             done_tx.take();
         };
+        // Drop every pair BEFORE deleting the candidates, and in that order.
+        //
+        // A local candidate owns its UDP socket, and `delete_all_candidates`
+        // was the only release. But the candidate lists are not its only
+        // owners: each connectivity-check pair holds one, and on a host with
+        // many addresses that is dozens of references per candidate. The
+        // checklist and selected pair live on `agent_conn` — the `Conn` handed
+        // to the caller, which an upper layer keeps for as long as it likes —
+        // so a close that left them populated kept one socket per candidate
+        // open for the life of that conn. Downstream that was one WebRTC
+        // session's worth of descriptors leaked per session, until the process
+        // could no longer bind a socket and gathered no candidates at all.
+        //
+        // Clearing first also means the candidate is down to its own list
+        // entry and its receive task by the time `close` reaches it, so the
+        // socket goes back to the OS as that task winds up rather than
+        // whenever the last pair happens to be dropped.
+        {
+            let mut checklist = self.agent_conn.checklist.lock().await;
+            checklist.clear();
+        }
+        self.agent_conn.selected_pair.store(None);
+        {
+            let mut nominated_pair = self.nominated_pair.lock().await;
+            nominated_pair.take();
+        }
         self.delete_all_candidates().await;
         {
             let mut started_ch_tx = self.started_ch_tx.lock().await;
