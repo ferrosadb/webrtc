@@ -515,7 +515,20 @@ impl Association {
                         let raw = buf.as_ref();
                         if let Err(err) = net_conn.send(raw.as_ref()).await {
                             log::warn!("[{name2}] failed to write packets on net_conn: {err}");
-                            done2.store(true, Ordering::Relaxed)
+                            done2.store(true, Ordering::Relaxed);
+                            // Stop the batch, not just the association.
+                            //
+                            // `done` is only read by the outer loop, so without
+                            // this every remaining packet of the gathered batch
+                            // was marshalled, sent to an already-closed conn,
+                            // failed, and logged an identical line. Downstream
+                            // that was hundreds of warnings inside a single
+                            // millisecond on every teardown — a log burst wide
+                            // enough to bury whatever actually closed the conn.
+                            //
+                            // The conn is gone; the rest of this batch cannot
+                            // reach anyone.
+                            break;
                         } else {
                             bytes_sent.fetch_add(raw.len(), Ordering::SeqCst);
                         }

@@ -39,6 +39,7 @@ pub(crate) async fn pipe(
 
 #[tokio::test]
 async fn test_remote_local_addr() -> Result<()> {
+    let _descriptors = descriptor_guard();
     // Agent0 is behind 1:1 NAT
     let nat_type0 = nat::NatType {
         mode: nat::NatMode::Nat1To1,
@@ -101,7 +102,8 @@ async fn test_remote_local_addr() -> Result<()> {
 
 #[tokio::test]
 async fn test_conn_stats() -> Result<()> {
-    let (ca, cb, _, _) = pipe(None, None).await?;
+    let _descriptors = descriptor_guard();
+    let (ca, cb, _, _) = pipe(Some(loopback_only()), Some(loopback_only())).await?;
     let na = ca.send(&[0u8; 10]).await?;
 
     let wg = WaitGroup::new();
@@ -130,6 +132,46 @@ fn open_descriptors() -> usize {
     std::fs::read_dir("/dev/fd").expect("/dev/fd").count()
 }
 
+/// Held for the duration of any test that counts descriptors.
+///
+/// `open_descriptors` is a PROCESS-wide count, and `cargo test` runs the suite
+/// in one process with a thread per test. A neighbour opening a socket between
+/// this test's baseline and its final read is indistinguishable from a socket
+/// this test leaked, so the assertion fails for a reason that has nothing to do
+/// with the code under test. Alone it passed; in the suite it did not.
+///
+/// Serialising the descriptor-counting tests against each other is enough: they
+/// are the only ones here that open sockets in bulk, and loopback-only
+/// gathering keeps everything else quiet.
+static DESCRIPTOR_COUNT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the descriptor lock, surviving a panic in an earlier holder.
+///
+/// A failing test poisons the mutex, and a poisoned mutex would turn one real
+/// failure into a cascade of unrelated ones that hide it.
+fn descriptor_guard() -> std::sync::MutexGuard<'static, ()> {
+    DESCRIPTOR_COUNT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Two agents that gather on loopback only.
+///
+/// The tests below open real sockets and run real connectivity checks. Left to
+/// gather on every interface, on a host with a couple of dozen addresses, they
+/// take forty-odd sockets apiece and enough CPU to knock over their neighbours
+/// — `udp_mux_test::test_udp_mux` failed beside them while passing on its own.
+/// Loopback is all these tests need: one candidate each, fast and self-
+/// contained, and a socket that is not released is just as visible.
+fn loopback_only() -> AgentConfig {
+    AgentConfig {
+        network_types: vec![NetworkType::Udp4],
+        interface_filter: Arc::new(Some(Box::new(|name: &str| name == "lo" || name == "lo0"))),
+        include_loopback: true,
+        ..Default::default()
+    }
+}
+
 /// After `Agent::close`, none of the agent's candidate sockets may survive —
 /// even while the `Conn` the agent handed out is still held by the caller.
 ///
@@ -146,8 +188,9 @@ fn open_descriptors() -> usize {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_close_releases_candidate_sockets_while_conn_is_held() -> Result<()> {
+    let _descriptors = descriptor_guard();
     let baseline = open_descriptors();
-    let (ca, cb, a_agent, b_agent) = pipe(None, None).await?;
+    let (ca, cb, a_agent, b_agent) = pipe(Some(loopback_only()), Some(loopback_only())).await?;
     let during = open_descriptors();
     assert!(
         during > baseline,
@@ -157,18 +200,30 @@ async fn test_close_releases_candidate_sockets_while_conn_is_held() -> Result<()
     a_agent.close().await?;
     b_agent.close().await?;
 
+    // Judge the release against what THIS test opened, not against an absolute
+    // count. `open_descriptors` is process-wide, and the crate's other tests
+    // open sockets of their own on neighbouring threads; asserting
+    // `after <= baseline` made a neighbour's descriptor indistinguishable from
+    // a leaked one, and the test failed in the suite while passing alone.
+    //
+    // The defect has a wide signature: when close leaks, every socket stays, so
+    // `after` sits up at `during`. When it does not, `after` falls back to
+    // `baseline`. Halfway between the two separates those cleanly and still
+    // leaves room for a few descriptors that are nothing to do with us.
+    let midpoint = baseline + (during - baseline) / 2;
+
     // Socket release rides on task teardown, which is asynchronous; wait a
     // bounded moment rather than asserting on the first read.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut after = open_descriptors();
-    while after > baseline + 2 && tokio::time::Instant::now() < deadline {
+    while after > midpoint && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
         after = open_descriptors();
     }
     assert!(
-        after <= baseline + 2,
+        after <= midpoint,
         "closed agents must release their candidate sockets even while their conns are held: \
-         baseline={baseline} during={during} after={after}"
+         baseline={baseline} during={during} after={after} (expected at or below {midpoint})"
     );
 
     drop(ca);
@@ -191,15 +246,17 @@ async fn test_close_releases_candidate_sockets_while_conn_is_held() -> Result<()
 #[cfg(unix)]
 #[tokio::test]
 async fn a_second_session_connects_after_the_first_one_closed() -> Result<()> {
+    let _descriptors = descriptor_guard();
     const SESSIONS: usize = 2;
     const PER_SESSION: Duration = Duration::from_secs(30);
 
     for session in 0..SESSIONS {
-        let connected = tokio::time::timeout(PER_SESSION, pipe(None, None))
-            .await
-            .unwrap_or_else(|_| {
-                panic!("session {session} did not connect within {PER_SESSION:?}")
-            })?;
+        let connected = tokio::time::timeout(
+            PER_SESSION,
+            pipe(Some(loopback_only()), Some(loopback_only())),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("session {session} did not connect within {PER_SESSION:?}"))?;
         let (ca, cb, a_agent, b_agent) = connected;
 
         // Connected is not the same as usable, and the downstream symptom was
