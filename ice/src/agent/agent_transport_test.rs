@@ -123,3 +123,98 @@ async fn test_conn_stats() -> Result<()> {
 
     Ok(())
 }
+
+/// Descriptors this process holds open, via `/dev/fd` (macOS and Linux).
+#[cfg(unix)]
+fn open_descriptors() -> usize {
+    std::fs::read_dir("/dev/fd").expect("/dev/fd").count()
+}
+
+/// After `Agent::close`, none of the agent's candidate sockets may survive —
+/// even while the `Conn` the agent handed out is still held by the caller.
+///
+/// Every host candidate owns a UDP socket. `close` deletes the agent's
+/// candidate lists, but the connectivity checklist and selected pair live on
+/// the `AgentConn` handed to the caller, and each pair holds its local
+/// candidate, which holds the socket. An upper layer that keeps the conn a
+/// moment longer (a reader task draining, a mux closing) therefore keeps every
+/// socket the agent ever gathered — and a layer that keeps it forever leaks
+/// them all. Measured downstream at one socket per candidate per session,
+/// until the process hit its descriptor limit and could gather nothing.
+///
+/// Holding the conns across the close here is the point of the test.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_close_releases_candidate_sockets_while_conn_is_held() -> Result<()> {
+    let baseline = open_descriptors();
+    let (ca, cb, a_agent, b_agent) = pipe(None, None).await?;
+    let during = open_descriptors();
+    assert!(
+        during > baseline,
+        "a connected pair of agents holds sockets: baseline={baseline} during={during}"
+    );
+
+    a_agent.close().await?;
+    b_agent.close().await?;
+
+    // Socket release rides on task teardown, which is asynchronous; wait a
+    // bounded moment rather than asserting on the first read.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut after = open_descriptors();
+    while after > baseline + 2 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        after = open_descriptors();
+    }
+    assert!(
+        after <= baseline + 2,
+        "closed agents must release their candidate sockets even while their conns are held: \
+         baseline={baseline} during={during} after={after}"
+    );
+
+    drop(ca);
+    drop(cb);
+    Ok(())
+}
+
+/// A listener serves session after session in one process. The second must
+/// connect as readily as the first.
+///
+/// This is the ICE-layer statement of the regression that kept the socket
+/// release fix out of ferrosa-memory: with that fix patched in, the SECOND
+/// full control session in a process never opened its data channel, while
+/// stock 0.17.1 and 0.17.2 both managed it. If the cause is in this crate,
+/// this test is where it shows: two `pipe()`s back to back, each proving it
+/// carries a datagram, with the first pair closed before the second begins.
+///
+/// Timed rather than left to hang — a session that never connects is the
+/// failure under test, and a test that hangs reports nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_second_session_connects_after_the_first_one_closed() -> Result<()> {
+    const SESSIONS: usize = 2;
+    const PER_SESSION: Duration = Duration::from_secs(30);
+
+    for session in 0..SESSIONS {
+        let connected = tokio::time::timeout(PER_SESSION, pipe(None, None))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("session {session} did not connect within {PER_SESSION:?}")
+            })?;
+        let (ca, cb, a_agent, b_agent) = connected;
+
+        // Connected is not the same as usable, and the downstream symptom was
+        // a connection that formed and then carried nothing.
+        ca.send(b"ping").await?;
+        let mut buf = vec![0_u8; 16];
+        let n = tokio::time::timeout(PER_SESSION, cb.recv(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("session {session} carried no datagram"))?;
+        assert_eq!(&buf[..n], b"ping", "session {session} payload");
+
+        a_agent.close().await?;
+        b_agent.close().await?;
+        drop(ca);
+        drop(cb);
+    }
+    Ok(())
+}

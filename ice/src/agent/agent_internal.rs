@@ -624,6 +624,31 @@ impl AgentInternal {
             done_tx.take();
         };
         self.delete_all_candidates().await;
+        // Deleting the candidates is not enough to release their sockets: a
+        // local candidate owns its UDP socket, and every connectivity-check
+        // pair holds a candidate. On a host with many addresses that is dozens
+        // of references each. The checklist and selected pair live on
+        // `agent_conn` — the `Conn` handed to the caller, which an upper layer
+        // keeps for as long as it needs it — so a close that left them
+        // populated kept one socket per candidate open for the life of that
+        // conn. Downstream that leaked a session's worth of descriptors per
+        // session until the process could bind no socket at all.
+        //
+        // Order matters, and not in the direction you would guess. Clearing
+        // these BEFORE `delete_all_candidates` also releases the sockets, but
+        // it leaves the agent in a state that stops the NEXT agent in the
+        // process from completing its connectivity checks — see
+        // `a_second_session_connects_after_the_first_one_closed`. Close the
+        // candidates first, then drop what still points at them.
+        {
+            let mut checklist = self.agent_conn.checklist.lock().await;
+            checklist.clear();
+        }
+        self.agent_conn.selected_pair.store(None);
+        {
+            let mut nominated_pair = self.nominated_pair.lock().await;
+            nominated_pair.take();
+        }
         {
             let mut started_ch_tx = self.started_ch_tx.lock().await;
             started_ch_tx.take();
