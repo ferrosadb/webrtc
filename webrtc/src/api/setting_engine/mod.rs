@@ -106,6 +106,8 @@ pub struct SettingEngine {
     pub(crate) enable_sender_rtx: bool,
     /// Determines the max size of any message that may be sent through an SCTP transport.
     pub(crate) sctp_max_message_size_can_send: SctpMaxMessageSize,
+    /// SCTP packet size budget; 0 leaves the association's default.
+    pub(crate) sctp_mtu: u32,
 }
 
 impl SettingEngine {
@@ -386,4 +388,28 @@ impl SettingEngine {
     ) {
         self.sctp_max_message_size_can_send = max_message_size_can_send
     }
+
+    /// set_sctp_mtu sets the largest SCTP packet the association sends, before
+    /// DTLS, UDP and IP overhead. 0 restores the association default
+    /// (1191, sized for a 1280-byte IPv6 path).
+    ///
+    /// SCTP here does no path MTU discovery, so this never adapts at runtime.
+    /// A path that silently drops datagrams above its limit, and is narrower
+    /// than this budget plus the layers below it (DTLS, TURN framing, a 464XLAT
+    /// translator), stalls every ordered stream behind the first full-size
+    /// packet. Lower it when the deployment's paths are known to be narrower.
+    ///
+    /// Values between 1 and `SCTP_MIN_MTU` are refused: below that, a packet
+    /// cannot carry the association's own control chunks.
+    pub fn set_sctp_mtu(&mut self, mtu: u32) -> Result<()> {
+        if mtu != 0 && mtu < Self::SCTP_MIN_MTU {
+            return Err(Error::ErrSettingEngineSetSctpMtu);
+        }
+        self.sctp_mtu = mtu;
+        Ok(())
+    }
+
+    /// The smallest SCTP packet budget `set_sctp_mtu` accepts: IPv4's 576-byte
+    /// minimum reassembly size less a 60-byte IP header and 8 bytes of UDP.
+    pub const SCTP_MIN_MTU: u32 = 508;
 }
