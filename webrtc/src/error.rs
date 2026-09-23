@@ -367,6 +367,8 @@ pub enum Error {
     ErrSDPMediaSectionMultipleTrackInvalid,
     #[error("set_answering_dtlsrole must DTLSRoleClient or DTLSRoleServer")]
     ErrSettingEngineSetAnsweringDTLSRole,
+    #[error("set_sctp_mtu must be 0 (default) or at least SettingEngine::SCTP_MIN_MTU")]
+    ErrSettingEngineSetSctpMtu,
     #[error("can't rollback from stable state")]
     ErrSignalingStateCannotRollback,
     #[error(

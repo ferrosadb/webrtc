@@ -168,7 +168,7 @@ impl RTCSctpTransport {
                         net_conn: Arc::clone(net_conn) as Arc<dyn Conn + Send + Sync>,
                         max_receive_buffer_size: 0,
                         max_message_size,
-                        mtu: 0,
+                        mtu: self.setting_engine.sctp_mtu,
                         name: String::new(),
                         local_port,
                         remote_port,

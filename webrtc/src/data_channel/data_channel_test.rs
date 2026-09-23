@@ -1848,3 +1848,142 @@ async fn test_data_channel_ortc_e2e() -> Result<()> {
 
     Ok(())
 }
+
+/// Two peers whose datagrams cross a router that silently drops any UDP payload
+/// over `path_limit` bytes: a path MTU black hole, with no ICMP.
+async fn black_hole_pair(
+    path_limit: usize,
+    sctp_mtu: u32,
+) -> Result<(RTCPeerConnection, RTCPeerConnection, Arc<AtomicUsize>)> {
+    use util::vnet::chunk::Chunk;
+    use util::vnet::net::{Net, NetConfig};
+    use util::vnet::router::{Router, RouterConfig};
+
+    let wan = Arc::new(Mutex::new(Router::new(RouterConfig {
+        cidr: "1.2.3.0/24".to_owned(),
+        ..Default::default()
+    })?));
+    let largest = Arc::new(AtomicUsize::new(0));
+    {
+        let largest = Arc::clone(&largest);
+        wan.lock()
+            .await
+            .add_chunk_filter(Box::new(move |c: &(dyn Chunk + Send + Sync)| {
+                let size = c.user_data().len();
+                if size > path_limit {
+                    return false;
+                }
+                largest.fetch_max(size, Ordering::SeqCst);
+                true
+            }))
+            .await;
+    }
+
+    let mut peers = vec![];
+    for ip in ["1.2.3.4", "1.2.3.5"] {
+        let vnet = Arc::new(Net::new(Some(NetConfig {
+            static_ips: vec![ip.to_owned()],
+            ..Default::default()
+        })));
+        let nic = vnet.get_nic()?;
+        wan.lock().await.add_net(Arc::clone(&nic)).await?;
+        nic.lock().await.set_router(Arc::clone(&wan)).await?;
+        let mut s = SettingEngine::default();
+        s.set_vnet(Some(vnet));
+        s.set_sctp_mtu(sctp_mtu)?;
+        peers.push(s);
+    }
+    wan.lock().await.start().await?;
+
+    let answer_engine = peers.pop().unwrap();
+    let offer_engine = peers.pop().unwrap();
+    let offer = APIBuilder::new()
+        .with_setting_engine(offer_engine)
+        .build()
+        .new_peer_connection(RTCConfiguration::default())
+        .await?;
+    let answer = APIBuilder::new()
+        .with_setting_engine(answer_engine)
+        .build()
+        .new_peer_connection(RTCConfiguration::default())
+        .await?;
+    Ok((offer, answer, largest))
+}
+
+/// Send one message across a black-hole path and report whether it arrived
+/// intact, and the largest datagram that crossed.
+async fn cross_black_hole(path_limit: usize, sctp_mtu: u32) -> Result<(bool, usize)> {
+    let (mut offer, mut answer, largest) = black_hole_pair(path_limit, sctp_mtu).await?;
+    let message = Bytes::from(vec![b'm'; 16 * 1024]);
+
+    let (tx, mut rx) = mpsc::channel::<Bytes>(1);
+    answer.on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
+        let tx = tx.clone();
+        Box::pin(async move {
+            if d.label() != EXPECTED_LABEL {
+                return;
+            }
+            d.on_message(Box::new(move |msg: DataChannelMessage| {
+                let tx = tx.clone();
+                Box::pin(async move {
+                    let _ = tx.send(msg.data).await;
+                })
+            }));
+        })
+    }));
+
+    let dc = offer.create_data_channel(EXPECTED_LABEL, None).await?;
+    let (open_tx, mut open_rx) = mpsc::channel::<()>(1);
+    dc.on_open(Box::new(move || {
+        Box::pin(async move {
+            let _ = open_tx.send(()).await;
+        })
+    }));
+    signal_pair(&mut offer, &mut answer).await?;
+    tokio::time::timeout(Duration::from_secs(10), open_rx.recv())
+        .await
+        .map_err(|_| Error::new("data channel never opened".to_owned()))?;
+
+    dc.send(&message).await?;
+    let arrived = matches!(
+        tokio::time::timeout(Duration::from_secs(5), rx.recv()).await,
+        Ok(Some(ref got)) if *got == message
+    );
+    close_pair_now(&offer, &answer).await;
+    Ok((arrived, largest.load(Ordering::SeqCst)))
+}
+
+#[tokio::test]
+async fn test_sctp_mtu_bounds_every_datagram() -> Result<()> {
+    // 1000 bytes of SCTP plus DTLS fits under 1100; the default 1191 does not.
+    let (arrived, largest) = cross_black_hole(1100, 1000).await?;
+    assert!(
+        arrived,
+        "a 16 KiB message must cross when SCTP packets fit the path"
+    );
+    assert!(
+        largest <= 1100,
+        "a {largest}-byte datagram exceeded the path"
+    );
+
+    let (arrived, _) = cross_black_hole(1100, 0).await?;
+    assert!(
+        !arrived,
+        "the default SCTP packet does not fit this path, so the test proves nothing"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_set_sctp_mtu_refuses_a_budget_below_the_minimum() {
+    let mut s = SettingEngine::default();
+    assert!(s.set_sctp_mtu(0).is_ok());
+    assert!(s.set_sctp_mtu(SettingEngine::SCTP_MIN_MTU).is_ok());
+    assert_eq!(s.sctp_mtu, SettingEngine::SCTP_MIN_MTU);
+    assert!(s.set_sctp_mtu(SettingEngine::SCTP_MIN_MTU - 1).is_err());
+    assert_eq!(
+        s.sctp_mtu,
+        SettingEngine::SCTP_MIN_MTU,
+        "a refused value must not stick"
+    );
+}
