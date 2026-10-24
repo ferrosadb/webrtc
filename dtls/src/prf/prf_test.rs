@@ -32,6 +32,51 @@ fn test_pre_master_secret() -> Result<()> {
     Ok(())
 }
 
+/// Every curve a ClientHello offers must agree on one secret from the encoded
+/// public keys alone, which is all a peer ever sees. The client offers P-256
+/// first, so the existing handshake tests only ever reached P-256: this is
+/// the coverage P-384 and X25519 had, and the encoding check is what pins the
+/// wire format across an elliptic-curve major bump.
+#[test]
+fn test_pre_master_secret_agrees_on_every_curve() -> Result<()> {
+    // Uncompressed SEC1 (0x04 || X || Y) for the NIST curves; raw for X25519.
+    let curves = [
+        (NamedCurve::P256, 65),
+        (NamedCurve::P384, 97),
+        (NamedCurve::X25519, 32),
+    ];
+    for (curve, encoded_len) in curves {
+        let a = curve.generate_keypair()?;
+        let b = curve.generate_keypair()?;
+        assert_eq!(a.public_key.len(), encoded_len, "{curve:?} public key length");
+        if curve != NamedCurve::X25519 {
+            assert_eq!(a.public_key[0], 0x04, "{curve:?} must stay uncompressed");
+        }
+
+        let from_a = prf_pre_master_secret(&b.public_key, &a.private_key, curve)?;
+        let from_b = prf_pre_master_secret(&a.public_key, &b.private_key, curve)?;
+        assert_eq!(from_a, from_b, "{curve:?} sides derived different secrets");
+        assert!(from_a.iter().any(|&x| x != 0), "{curve:?} derived an all-zero secret");
+    }
+    Ok(())
+}
+
+/// A peer point that is not on the curve is refused, never agreed with.
+#[test]
+fn test_pre_master_secret_refuses_an_invalid_point() -> Result<()> {
+    for curve in [NamedCurve::P256, NamedCurve::P384] {
+        let ours = curve.generate_keypair()?;
+        let mut theirs = curve.generate_keypair()?.public_key;
+        let last = theirs.len() - 1;
+        theirs[last] ^= 0x01; // Y no longer satisfies the curve equation
+        assert!(
+            prf_pre_master_secret(&theirs, &ours.private_key, curve).is_err(),
+            "{curve:?} accepted an off-curve point"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn test_master_secret() -> Result<()> {
     let pre_master_secret = vec![

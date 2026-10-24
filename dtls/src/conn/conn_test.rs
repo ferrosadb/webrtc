@@ -173,6 +173,35 @@ async fn test_routine_leak_on_close() -> Result<()> {
     Ok(())
 }
 
+/// A handshake over a lossless pipe must finish inside the first flight's
+/// retransmit interval. Every other test here only asks that a handshake
+/// completes, and one that needs a retransmit still completes, a second later,
+/// so a change that makes a flight fail or the key exchange slow passes them
+/// all while every real connection setup pays for it. That is a hot path: the
+/// control channel and every data channel sit behind this handshake.
+#[tokio::test]
+async fn test_handshake_finishes_before_the_first_retransmit() -> Result<()> {
+    let started = tokio::time::Instant::now();
+    let (ca, cb) = build_pipe().await?;
+    let handshake = started.elapsed();
+
+    let sent = vec![0x5A; 100];
+    ca.write(&sent, Some(Duration::from_secs(5))).await?;
+    let mut got = vec![0; 1024];
+    let n = cb.read(&mut got, Some(Duration::from_secs(5))).await?;
+    assert_eq!(&sent[..], &got[..n]);
+
+    assert!(
+        handshake < INITIAL_TICKER_INTERVAL,
+        "handshake took {handshake:?}, at least one flight was retransmitted \
+         (retransmit interval {INITIAL_TICKER_INTERVAL:?})"
+    );
+
+    ca.close().await?;
+    cb.close().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_sequence_number_overflow_on_application_data() -> Result<()> {
     /*env_logger::Builder::new()
