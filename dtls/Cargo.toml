@@ -14,11 +14,17 @@ util = { workspace = true, default-features = false, features = ["conn"] }
 
 byteorder = "1"
 rand_core = "0.6"
-p256 = { version = "0.13", features = ["default", "ecdh", "ecdsa"] }
-p384 = "0.13"
+# 0.14 for crypto-bigint 0.7: elliptic-curve 0.13 pins crypto-bigint 0.5,
+# which branches on secret values (RUSTSEC-2026-0387). Only ECDH and SEC1
+# point decoding are used here; signatures go through ring/rustls.
+p256 = { version = "0.14", default-features = false, features = ["ecdh", "std"] }
+p384 = { version = "0.14", default-features = false, features = ["ecdh", "std"] }
+# PublicKey::{from,to}_sec1_bytes sit behind elliptic-curve's `sec1` feature,
+# which p256/p384 0.14 do not re-export.
+elliptic-curve = { version = "0.14.1", default-features = false, features = ["alloc", "sec1"] }
 rand = "0.9"
 hmac = "0.12"
-sec1 = { version = "0.7", features = ["std"] }
+sec1 = { version = "0.8", features = ["std"] }
 sha1 = "0.10"
 sha2 = "0.10"
 aes = "0.8"
