@@ -1729,6 +1729,8 @@ mod virtual_clock_tests {
         /// Locally gathered candidates not yet handed to the peer.
         pending_candidates: StdMutex<Vec<RTCIceCandidateInit>>,
         conn: StdMutex<Vec<RTCPeerConnectionState>>,
+        /// Data channels the remote side opened, as `on_data_channel` reported them.
+        remote_channels: std::sync::atomic::AtomicUsize,
     }
 
     impl StateRecorder {
@@ -1751,6 +1753,11 @@ mod virtual_clock_tests {
             self.conn.lock().expect("recorder poisoned").clone()
         }
 
+        fn remote_channels(&self) -> usize {
+            self.remote_channels
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
         fn take_candidates(&self) -> Vec<RTCIceCandidateInit> {
             std::mem::take(&mut *self.pending_candidates.lock().expect("recorder poisoned"))
         }
@@ -1764,6 +1771,11 @@ mod virtual_clock_tests {
 
         async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
             self.conn.lock().expect("recorder poisoned").push(state);
+        }
+
+        async fn on_data_channel(&self, _data_channel: Arc<dyn DataChannel>) {
+            self.remote_channels
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
 
         async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {
@@ -1937,6 +1949,55 @@ mod virtual_clock_tests {
             "a virtual-clock test must not spend real time: took {:?}",
             wall_clock_start.elapsed()
         );
+    }
+
+    /// Once ICE has connected, DTLS, SCTP and the data channel open need no timer.
+    ///
+    /// Each step is a reply to a packet or to the step before it: the selected pair starts
+    /// the DTLS client's ClientHello, the finished handshake starts SCTP's INIT, the
+    /// established association sends the DCEP open. None of those packets waits on a
+    /// deadline, so they must leave as soon as they are produced. The virtual clock is frozen
+    /// here, so any packet that the driver left queued until "the next timer" never leaves,
+    /// and the channel never reaches the answerer.
+    ///
+    /// Two defects held packets that way. The driver loop flushed writes before handling
+    /// events and reads, then slept, so work those passes produced waited for a timer. And
+    /// the rtc DTLS handler queued a client's first flight without draining it, so the
+    /// ClientHello waited for `handle_timeout`. Either one alone fails this test.
+    #[test]
+    fn handshakes_after_ice_proceed_without_any_timer_firing() {
+        let network = Arc::new(MockUDPNetwork::new());
+        let driver = MockRuntime::new();
+        driver.block_on(Box::pin(async {
+            let (offerer, answerer) = connect_pair(&network).await;
+            let frozen_at = (offerer.rt.now(), answerer.rt.now());
+
+            // Yield to the driver threads only. No clock moves, so no protocol timer fires.
+            let mut opened = false;
+            for _ in 0..500 {
+                if answerer.rec.remote_channels() > 0
+                    && offerer.rec.saw_conn(RTCPeerConnectionState::Connected)
+                {
+                    opened = true;
+                    break;
+                }
+                settle();
+            }
+
+            assert_eq!(
+                (offerer.rt.now(), answerer.rt.now()),
+                frozen_at,
+                "the clocks must not move, or a timer could have carried the handshake"
+            );
+            assert!(
+                opened,
+                "with the clock frozen after ICE, the data channel must still open; \
+                 offerer {:?}, answerer {:?}, channels at answerer {}",
+                offerer.rec.conn_states(),
+                answerer.rec.conn_states(),
+                answerer.rec.remote_channels()
+            );
+        }));
     }
 
     /// **The headline claim.** ICE consent freshness (RFC 7675) fails when a peer stops

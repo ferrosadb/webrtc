@@ -850,6 +850,12 @@ where
             self.poll_writes().await?;
             self.poll_events().await;
             self.poll_reads().await?;
+            // Events and reads hand work to the protocol handlers: ICE connecting
+            // starts DTLS, DTLS completing starts SCTP, SCTP establishing opens the
+            // data channels. The handlers queue the packets that work produces, and
+            // nothing else flushes them before `select!` sleeps until the next timer.
+            // Flush them now, or each handshake step waits out an unrelated timer.
+            self.poll_writes().await?;
 
             // Wake senders blocked in `DataChannel::writable()`: the poll_* passes above
             // applied any SCTP buffer releases (acked/abandoned bytes) to the per-channel
@@ -1949,6 +1955,15 @@ where
             }
         }
 
+        // 1.c peer_connection poll_write() - Send all outgoing packets, coalescing
+        // consecutive same-destination datagrams into single UDP GSO syscalls.
+        let writes = Self::drain_core_writes(self.inner.clone()).await;
+        self.flush_writes(writes).await;
+
+        // After the core, not before it. A core packet bound for a relay candidate
+        // goes through `handle_write` into the relayer's queue, so draining the
+        // relayer first left every relayed packet of this pass waiting for the
+        // next one, which is the next timer when nothing else wakes the loop.
         // 1.b turn_relayer poll_write()
         while let Some(msg) = self.turn_relayer.poll_write() {
             let four_tuple: FourTuple = FourTuple::from(&msg.transport);
@@ -1968,11 +1983,6 @@ where
                 }
             }
         }
-
-        // 1.c peer_connection poll_write() - Send all outgoing packets, coalescing
-        // consecutive same-destination datagrams into single UDP GSO syscalls.
-        let writes = Self::drain_core_writes(self.inner.clone()).await;
-        self.flush_writes(writes).await;
 
         Ok(())
     }
