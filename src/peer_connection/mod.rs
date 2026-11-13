@@ -1289,6 +1289,11 @@ impl PeerConnection for PeerConnectionImpl {
             let mut core = self.inner.core.lock().await;
             core.add_remote_candidate(candidate.clone())?;
         }
+        // The core requests a connectivity check for the new candidate, which shows up as an
+        // immediate deadline from poll_timeout. Wake the driver so it re-polls, as
+        // set_remote_description does; otherwise the check waits for the driver's previous
+        // deadline, up to a whole check tick.
+        self.inner.wake_writes().await;
 
         let candidate_str = match candidate.candidate.strip_prefix("candidate:") {
             Some(s) => s,
@@ -1996,6 +2001,106 @@ mod virtual_clock_tests {
                 offerer.rec.conn_states(),
                 answerer.rec.conn_states(),
                 answerer.rec.remote_channels()
+            );
+        }));
+    }
+
+    /// A trickled candidate is checked as soon as it is added, with no timer.
+    ///
+    /// Both descriptions are applied first, carrying no candidates, and the forced contact
+    /// they request runs against an empty remote list. The clocks are then frozen and each
+    /// peer's candidates reach the other only through `add_ice_candidate`. The core requests
+    /// a check for each, but the driver sleeps until its next deadline unless something wakes
+    /// it, and under a frozen clock no deadline arrives. So ICE connecting here means the
+    /// add woke the driver. Measured cost without it: up to one 200 ms check tick for every
+    /// connect whose working candidate was trickled.
+    #[test]
+    fn trickled_candidates_are_checked_without_any_timer_firing() {
+        let network = Arc::new(MockUDPNetwork::new());
+        let driver = MockRuntime::new();
+        driver.block_on(Box::pin(async {
+            let offerer = build_peer(&network).await;
+            let answerer = build_peer(&network).await;
+            offerer
+                .pc
+                .create_data_channel("probe", None)
+                .await
+                .expect("create data channel");
+            let offer = offerer.pc.create_offer(None).await.expect("create offer");
+            offerer
+                .pc
+                .set_local_description(offer.clone())
+                .await
+                .expect("set local description");
+            answerer
+                .pc
+                .set_remote_description(offer)
+                .await
+                .expect("set remote description");
+            let answer = answerer
+                .pc
+                .create_answer(None)
+                .await
+                .expect("create answer");
+            answerer
+                .pc
+                .set_local_description(answer.clone())
+                .await
+                .expect("set local description");
+            offerer
+                .pc
+                .set_remote_description(answer)
+                .await
+                .expect("set remote description");
+
+            // Collect each side's candidates without handing them over yet.
+            let (mut from_offerer, mut from_answerer) = (Vec::new(), Vec::new());
+            for _ in 0..200 {
+                from_offerer.extend(offerer.rec.take_candidates());
+                from_answerer.extend(answerer.rec.take_candidates());
+                if !from_offerer.is_empty() && !from_answerer.is_empty() {
+                    break;
+                }
+                settle();
+            }
+            assert!(
+                !from_offerer.is_empty() && !from_answerer.is_empty(),
+                "both peers must gather a host candidate on the mock network"
+            );
+            assert!(
+                !offerer.rec.saw_ice(RTCIceConnectionState::Connected),
+                "precondition: nothing to check until a candidate is trickled"
+            );
+
+            let frozen_at = (offerer.rt.now(), answerer.rt.now());
+            for c in from_offerer {
+                answerer.pc.add_ice_candidate(c).await.expect("add to answerer");
+            }
+            for c in from_answerer {
+                offerer.pc.add_ice_candidate(c).await.expect("add to offerer");
+            }
+
+            let mut connected = false;
+            for _ in 0..500 {
+                if offerer.rec.saw_ice(RTCIceConnectionState::Connected)
+                    && answerer.rec.saw_ice(RTCIceConnectionState::Connected)
+                {
+                    connected = true;
+                    break;
+                }
+                settle();
+            }
+            assert_eq!(
+                (offerer.rt.now(), answerer.rt.now()),
+                frozen_at,
+                "the clocks must not move, or a timer could have sent the checks"
+            );
+            assert!(
+                connected,
+                "with the clock frozen, trickled candidates must still be checked; \
+                 offerer {:?}, answerer {:?}",
+                offerer.rec.ice_states(),
+                answerer.rec.ice_states()
             );
         }));
     }
